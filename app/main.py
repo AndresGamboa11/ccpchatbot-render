@@ -57,8 +57,3 @@ async def webhook(req: Request):
 def healthz():
     return {"status": "ok"}
 -----------------------------
-@app.get("/webhook")
-def verify(mode: str = "", hub_mode: str = "", hub_challenge: str = "", hub_verify_token: str = ""):
-    if mode == "subscribe" and hub_verify_token == S.WA_VERIFY_TOKEN:
-        return PlainTextResponse(hub_challenge)
-    return PlainTextResponse("Error de verificación", status_code=403)
