@@ -2,37 +2,42 @@
 import httpx
 from typing import List, Dict, Any, Tuple
 from qdrant_client import QdrantClient
-from fastembed import TextEmbedding
+
+from app.embeddings import embed_texts  # <- usamos la API de HF (async)
 from app.settings import get_settings
 
 S = get_settings()
 
-# ---------------- Embeddings (FastEmbed) ----------------
-# Modelo multilingüe (español OK), 384 dims
-_EMBED_MODEL_NAME = "intfloat/multilingual-e5-small"
-_EMBEDDER = TextEmbedding(model_name=_EMBED_MODEL_NAME)
 
 def _connect_qdrant() -> QdrantClient:
     return QdrantClient(url=S.URL_QDRANT, api_key=S.CLAVE_API_QDRANT, timeout=60)
 
-def embed_text(texts: List[str]) -> List[List[float]]:
-    # FastEmbed devuelve un generador → lo convertimos a listas
-    return [vec for vec in _EMBEDDER.embed(texts)]
 
-def retrieve(query: str, k: int = 4) -> List[Dict[str, Any]]:
+async def retrieve(query: str, k: int = 4) -> List[Dict[str, Any]]:
+    """
+    Recupera los k fragmentos más relevantes desde Qdrant.
+    Genera el embedding del query usando Hugging Face (embed_texts) y ejecuta la búsqueda.
+    """
     client = _connect_qdrant()
-    qvec = embed_text([query])[0]
+    qvec = (await embed_texts([query]))[0]  # <- embedding async
     res = client.search(
         collection_name=S.COLECCION_QDRANT,
         query_vector=qvec,
         limit=k,
-        with_payload=True
+        with_payload=True,
     )
-    out = []
+    out: List[Dict[str, Any]] = []
     for p in res:
         payload = p.payload or {}
-        out.append({"text": payload.get("text", ""), "page": payload.get("page"), "score": float(p.score)})
+        out.append(
+            {
+                "text": payload.get("text", ""),
+                "page": payload.get("page"),
+                "score": float(p.score),
+            }
+        )
     return out
+
 
 def build_prompt(user_msg: str, ctx_snippets: List[Dict[str, Any]]) -> str:
     ctx_txt = "\n\n".join([f"- (pág.{c.get('page','?')}) {c['text']}" for c in ctx_snippets])
@@ -57,20 +62,29 @@ def build_prompt(user_msg: str, ctx_snippets: List[Dict[str, Any]]) -> str:
     )
     return final
 
+
 def is_greeting_or_farewell(text: str) -> Tuple[bool, str]:
     t = (text or "").lower()
     saludos = ["hola", "buenos días", "buenas tardes", "buenas noches", "qué tal", "buen día"]
     desped = ["gracias", "muchas gracias", "hasta luego", "chao", "adiós", "nos vemos"]
     if any(s in t for s in saludos):
-        return True, ("¡Hola! 👋 Soy el asistente de la Cámara de Comercio de Pamplona. "
-                      "¿En qué puedo ayudarte? Puedo orientarte sobre matrícula, renovación, "
-                      "ESAL, conciliación, RUES, certificados y eventos.")
+        return True, (
+            "¡Hola! 👋 Soy el asistente de la Cámara de Comercio de Pamplona. "
+            "¿En qué puedo ayudarte? Puedo orientarte sobre matrícula, renovación, "
+            "ESAL, conciliación, RUES, certificados y eventos."
+        )
     if any(d in t for d in desped):
-        return True, ("¡Con gusto! 😊 Si necesitas algo más de la Cámara de Comercio de Pamplona, "
-                      "escríbeme cuando quieras. ¡Que tengas un excelente día!")
+        return True, (
+            "¡Con gusto! 😊 Si necesitas algo más de la Cámara de Comercio de Pamplona, "
+            "escríbeme cuando quieras. ¡Que tengas un excelente día!"
+        )
     return False, ""
 
+
 async def call_groq_chat(system_prompt: str) -> str:
+    """
+    Llama a Groq (Gemma) por HTTP. Devuelve texto plano.
+    """
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {S.CLAVE_GROQ}", "Content-Type": "application/json"}
     payload = {
@@ -90,13 +104,18 @@ async def call_groq_chat(system_prompt: str) -> str:
         except Exception:
             return f"No pude generar respuesta (Groq). Detalle: {data}"
 
+
 async def answer_with_rag(user_msg: str) -> str:
+    # Small talk (saludos/despedidas)
     ok_small, smalltalk = is_greeting_or_farewell(user_msg)
     if ok_small:
         return smalltalk
-    ctx = retrieve(user_msg, k=5)
+
+    # Recuperación + generación
+    ctx = await retrieve(user_msg, k=5)  # <- ahora es async
     prompt = build_prompt(user_msg, ctx)
     answer = await call_groq_chat(prompt)
+
     if not ctx:
         answer += "\n\n(No encontré coincidencias en los documentos; intenta con otra consulta o actualiza el PDF)."
     return answer
