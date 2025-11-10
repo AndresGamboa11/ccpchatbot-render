@@ -5,7 +5,7 @@ from typing import List, Any, Iterable, Tuple
 from dotenv import load_dotenv
 from pypdf import PdfReader
 from qdrant_client import QdrantClient, models
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 
 def root_dir() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -67,8 +67,10 @@ def main():
     if not os.path.exists(args.pdf):
         print(f"❌ No existe el PDF: {args.pdf}"); sys.exit(1)
 
-    print("🧩 Cargando embeddings…")
-    model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    # ---- Embeddings (FastEmbed) ----
+    model_name = "intfloat/multilingual-e5-small"  # 384 dims, multilingüe
+    print(f"🧩 Cargando FastEmbed: {model_name}")
+    embedder = TextEmbedding(model_name=model_name)
     vector_dim = 384
 
     print(f"📄 Leyendo PDF: {args.pdf}")
@@ -80,8 +82,7 @@ def main():
     print(f"✅ Fragmentos: {len(chunks)}")
 
     print("⚙️ Generando embeddings…")
-    embs = model.encode(chunks, batch_size=32, show_progress_bar=True)
-    if hasattr(embs,"tolist"): embs = embs.tolist()
+    embs = [v for v in embedder.embed(chunks)]
 
     print(f"☁️ Conectando Qdrant: {URL_QDRANT}")
     client = QdrantClient(url=URL_QDRANT, api_key=CLAVE_API_QDRANT, timeout=90)
