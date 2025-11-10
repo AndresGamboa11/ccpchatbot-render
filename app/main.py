@@ -8,6 +8,11 @@ from app.settings import get_settings
 from app.rag import answer_with_rag
 from app.whatsapp import send_whatsapp_text
 
+from app.ingest_qdrant import search_docs
+
+docs = search_docs(text)  # busca los fragmentos relevantes
+answer = answer_with_rag(text, docs)
+
 S = get_settings()
 app = FastAPI(title="CCP Chatbot")
 
