@@ -1,22 +1,23 @@
 # app/rag.py
-import os
 import httpx
 from typing import List, Dict, Any, Tuple
-from sentence_transformers import SentenceTransformer
-from qdrant_client import QdrantClient, models
+from qdrant_client import QdrantClient
+from fastembed import TextEmbedding
 from app.settings import get_settings
 
 S = get_settings()
 
-# Cargar modelo de embeddings (una sola vez)
-_EMBED_MODEL = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+# ---------------- Embeddings (FastEmbed) ----------------
+# Modelo multilingüe (español OK), 384 dims
+_EMBED_MODEL_NAME = "intfloat/multilingual-e5-small"
+_EMBEDDER = TextEmbedding(model_name=_EMBED_MODEL_NAME)
 
 def _connect_qdrant() -> QdrantClient:
     return QdrantClient(url=S.URL_QDRANT, api_key=S.CLAVE_API_QDRANT, timeout=60)
 
 def embed_text(texts: List[str]) -> List[List[float]]:
-    vecs = _EMBED_MODEL.encode(texts, batch_size=32, show_progress_bar=False)
-    return vecs.tolist()
+    # FastEmbed devuelve un generador → lo convertimos a listas
+    return [vec for vec in _EMBEDDER.embed(texts)]
 
 def retrieve(query: str, k: int = 4) -> List[Dict[str, Any]]:
     client = _connect_qdrant()
@@ -43,15 +44,13 @@ def build_prompt(user_msg: str, ctx_snippets: List[Dict[str, Any]]) -> str:
         "\"Lo siento, solo puedo ayudarte con información de la Cámara de Comercio de Pamplona.\" "
         "Cuando el tema sea de la Cámara, usa listas cortas y evita inventar datos."
     )
-    user = f"Consulta del usuario: {user_msg}"
-    ctx = f"Contexto autorizado (extractos de documentos de la Cámara):\n{ctx_txt if ctx_txt else '- (sin coincidencias relevantes)'}"
     final = (
         f"{system}\n\n"
-        f"{ctx}\n\n"
+        f"Contexto autorizado (extractos):\n{ctx_txt if ctx_txt else '- (sin coincidencias relevantes)'}\n\n"
         f"Instrucciones:\n"
         f"- Máximo 6 líneas por respuesta.\n"
         f"- Si no encuentras respuesta en el contexto, dilo de forma clara.\n"
-        f"- Incluye números telefónicos o horarios sólo si están en el contexto.\n"
+        f"- Incluye teléfonos/horarios solo si están en el contexto.\n"
         f"- No repitas el contexto.\n"
         f"Usuario: {user_msg}\n"
         f"Respuesta:"
@@ -64,7 +63,7 @@ def is_greeting_or_farewell(text: str) -> Tuple[bool, str]:
     desped = ["gracias", "muchas gracias", "hasta luego", "chao", "adiós", "nos vemos"]
     if any(s in t for s in saludos):
         return True, ("¡Hola! 👋 Soy el asistente de la Cámara de Comercio de Pamplona. "
-                      "¿En qué puedo ayudarte hoy? Puedo orientarte sobre matrícula, renovación, "
+                      "¿En qué puedo ayudarte? Puedo orientarte sobre matrícula, renovación, "
                       "ESAL, conciliación, RUES, certificados y eventos.")
     if any(d in t for d in desped):
         return True, ("¡Con gusto! 😊 Si necesitas algo más de la Cámara de Comercio de Pamplona, "
@@ -72,14 +71,8 @@ def is_greeting_or_farewell(text: str) -> Tuple[bool, str]:
     return False, ""
 
 async def call_groq_chat(system_prompt: str) -> str:
-    """
-    Llama a Groq (Gemma) por HTTP. Devuelve texto plano.
-    """
     url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {S.CLAVE_GROQ}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {S.CLAVE_GROQ}", "Content-Type": "application/json"}
     payload = {
         "model": S.MODELO_GROQ,
         "messages": [
@@ -95,19 +88,15 @@ async def call_groq_chat(system_prompt: str) -> str:
         try:
             return data["choices"][0]["message"]["content"].strip()
         except Exception:
-            return f"Lo siento, no pude generar respuesta (Groq). Detalle: {data}"
+            return f"No pude generar respuesta (Groq). Detalle: {data}"
 
 async def answer_with_rag(user_msg: str) -> str:
-    # Saludos/despedidas y cortesías
-    is_smalltalk, smalltalk = is_greeting_or_farewell(user_msg)
-    if is_smalltalk:
+    ok_small, smalltalk = is_greeting_or_farewell(user_msg)
+    if ok_small:
         return smalltalk
-
-    # Recuperación y generación
     ctx = retrieve(user_msg, k=5)
     prompt = build_prompt(user_msg, ctx)
     answer = await call_groq_chat(prompt)
-    # Si no hay contexto y la IA lo indica ambiguo, reforzar mensaje
     if not ctx:
-        answer += "\n\n(No encontré coincidencias en los documentos; si deseas, envíame otra pregunta o comparte el PDF actualizado)."
+        answer += "\n\n(No encontré coincidencias en los documentos; intenta con otra consulta o actualiza el PDF)."
     return answer
