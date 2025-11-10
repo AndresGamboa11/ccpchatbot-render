@@ -1,32 +1,31 @@
-from pydantic import BaseModel
+# app/settings.py
 from pydantic_settings import BaseSettings
-import os
+from pydantic import Field
 
 class Settings(BaseSettings):
-    # Web
-    PORT: int = int(os.getenv("PORT", "10000"))
+    # --- WhatsApp Cloud API (ES + fallback EN) ---
+    TOKEN_WA: str = Field(default="", alias="WA_ACCESS_TOKEN")
+    ID_NUMERO_WA: str = Field(default="", alias="WA_PHONE_NUMBER_ID")
+    TOKEN_VERIFICACION_WA: str = Field(default="", alias="WA_VERIFY_TOKEN")
+    VERSION_WA: str = Field(default="v21.0", alias="WA_API_VERSION")
 
-    # WhatsApp Cloud API
-    WA_ACCESS_TOKEN: str = ""
-    WA_PHONE_NUMBER_ID: str = ""
-    WA_VERIFY_TOKEN: str = ""
-    WA_API_VERSION: str = "v21.0"
+    # --- Groq (Gemma) ---
+    CLAVE_GROQ: str = Field(default="", alias="GROQ_API_KEY")
+    MODELO_GROQ: str = Field(default="gemma2-9b-it", alias="GROQ_MODEL")
 
-    # Groq (LLM)
-    GROQ_API_KEY: str = ""
-    GROQ_MODEL: str = "gemma2-9b-it"
+    # --- Qdrant Cloud ---
+    URL_QDRANT: str = Field(default="", alias="QDRANT_URL")
+    CLAVE_API_QDRANT: str = Field(default="", alias="QDRANT_API_KEY")
+    COLECCION_QDRANT: str = Field(default="ccp_docs", alias="QDRANT_COLLECTION")
 
-    # Hugging Face (Embeddings vía API)
-    HF_API_TOKEN: str = ""
-    HF_EMBED_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
-    HF_API_URL: str = "https://api-inference.huggingface.co/pipeline/feature-extraction/"
+    # --- Afinado general ---
+    TAM_EMBED: int = 384
+    TIMEOUT_HTTP: int = 45
 
-    # Qdrant Cloud
-    QDRANT_URL: str = ""   # ej: https://XXXXX.us-east-1-0.aws.cloud.qdrant.io
-    QDRANT_API_KEY: str = ""
-    QDRANT_COLLECTION: str = "ccp_docs"
-    QDRANT_VECTOR_SIZE: int = 384
-    QDRANT_DISTANCE: str = "Cosine"
+    class Config:
+        extra = "ignore"
+        env_file = ".env"
+        env_file_encoding = "utf-8"
 
 def get_settings() -> Settings:
-    return Settings()
+    return Settings()  # lee .env automáticamente
