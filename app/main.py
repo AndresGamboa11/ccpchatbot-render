@@ -1,85 +1,125 @@
 # app/main.py
-import json
+import os, json, asyncio, logging
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.settings import get_settings
-from app.whatsapp import send_whatsapp_text
 from app.rag import answer_with_rag
+from app.whatsapp import send_whatsapp_text, send_typing_on
 from app.mcp_server import router as mcp_router
 
 S = get_settings()
-app = FastAPI(title="Chatbot CCP (Render)")
-app.include_router(mcp_router)
+app = FastAPI(title="CCP Chatbot")
 
-# CORS básico
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Logs útiles
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ccp")
+
+# estático opcional
+app.mount("/static", StaticFiles(directory="static", check_dir=False), name="static")
+
+# incluye MCP
+app.include_router(mcp_router)
 
 @app.get("/")
 def home():
-    return {"ok": True, "service": "Chatbot CCP online ✅"}
-
-# ------------ Verificación Webhook (GET) ------------
-@app.get("/webhook")
-def verify(mode: str = "", hub_mode: str = "", hub_challenge: str = "", hub_verify_token: str = ""):
-    token = hub_verify_token or ""
-    if token == S.TOKEN_VERIFICACION_WA:
-        return PlainTextResponse(hub_challenge or "")
-    return PlainTextResponse("403", status_code=403)
-
-# ------------ Recepción de mensajes (POST) ----------
-@app.post("/webhook")
-async def webhook(request: Request):
-    try:
-        body = await request.json()
-        # Navegar el payload típico de WhatsApp Cloud
-        entry = body.get("entry", [])[0]
-        changes = entry.get("changes", [])[0]
-        value = changes.get("value", {})
-        messages = value.get("messages", [])
-        if not messages:
-            return JSONResponse({"status": "no-message"}, status_code=200)
-
-        msg = messages[0]
-        from_number = msg.get("from")
-        mtype = msg.get("type")
-        text = ""
-        if mtype == "text":
-            text = msg["text"]["body"]
-        elif mtype == "interactive":
-            text = msg["interactive"]["list_reply"]["title"] if "list_reply" in msg["interactive"] else ""
-        else:
-            text = ""
-
-        # Generar respuesta
-        reply = await answer_with_rag(text or "")
-        await send_whatsapp_text(from_number, reply)
-        return JSONResponse({"ok": True})
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=200)
-# incluye MCP
-app.include_router(mcp_router)  # << IMPORTANTE
+    return {"ok": True, "service": "Chatbot CCP online"}
 
 @app.get("/healthz")
-def healthz():
-    return {"status": "ok"}
+async def healthz():
+    return {"ok": True, "env": "render", "port": os.environ.get("PORT")}
 
+# -------------------- WhatsApp Webhook --------------------
 
-@app.get("/debug/rag")
-async def debug_rag(q: str = ""):
+WA_VERIFY_TOKEN = os.getenv("WA_VERIFY_TOKEN", "")
+
+# 1) Verificación de webhook (GET)
+@app.get("/webhook")
+async def verify_webhook(mode: str = "", hub_mode: str = "", hub_challenge: str = "", hub_verify_token: str = ""):
+    # Meta puede enviar 'mode' ó 'hub.mode', etc. Capturo los dos por compatibilidad.
+    _mode = (mode or hub_mode or "").lower()
+    _token = (hub_verify_token or "").strip()
+
+    if _mode == "subscribe" and WA_VERIFY_TOKEN and _token == WA_VERIFY_TOKEN:
+        return PlainTextResponse(hub_challenge or "OK", status_code=200)
+    return PlainTextResponse("Forbidden", status_code=403)
+
+def _extract_wa_message(payload: dict):
     """
-    Diagnóstico de RAG. Ej: /debug/rag?q=horarios de atención
+    Devuelve (from_number, text) si hay un mensaje de usuario.
+    Si no hay mensaje (p.ej. es 'statuses'), devuelve (None, None).
     """
-    if not q.strip():
-        return JSONResponse({"error": "falta parámetro q"}, status_code=400)
     try:
-        ans = await answer_with_rag(q)  # si tu función no es async: ans = answer_with_rag(q)
-        return {"query": q, "answer": ans}
+        entry = payload["entry"][0]
+        changes = entry["changes"][0]
+        value = changes["value"]
+
+        # mensajes entrantes
+        if "messages" in value and value.get("messages"):
+            msg = value["messages"][0]
+            from_number = msg.get("from")
+            text = None
+            t = msg.get("type")
+            if t == "text":
+                text = (msg["text"].get("body") or "").strip()
+            elif t == "interactive":
+                # botones/listas
+                interactive = msg.get("interactive", {})
+                if interactive.get("type") == "button_reply":
+                    text = (interactive["button_reply"].get("title") or "").strip()
+                elif interactive.get("type") == "list_reply":
+                    text = (interactive["list_reply"].get("title") or "").strip()
+            elif t == "image":
+                text = "imagen"  # podrías manejar OCR si lo deseas
+            else:
+                text = None
+            return from_number, text
+
+        # estatus de entrega
+        if "statuses" in value:
+            return None, None
+    except Exception:
+        return None, None
+
+    return None, None
+
+# 2) Recepción de eventos (POST)
+@app.post("/webhook")
+async def receive_webhook(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"ok": True}, status_code=200)
+
+    logger.info("WA IN: %s", json.dumps(payload)[:2000])
+
+    from_number, text = _extract_wa_message(payload)
+    if not from_number:
+        # Importante: siempre responder 200 para que Meta no reintente infinitamente
+        return JSONResponse({"ok": True, "note": "no user message"}, status_code=200)
+
+    # Señal de 'escribiendo' (opcional)
+    try:
+        await send_typing_on(from_number)
+    except Exception:
+        pass
+
+    # Si no hay texto, responder ayuda mínima
+    if not text:
+        await send_whatsapp_text(from_number, "Hola 👋, por favor escribe tu consulta en texto.")
+        return JSONResponse({"ok": True}, status_code=200)
+
+    # Llama al RAG y responde
+    try:
+        answer = await answer_with_rag(text)
+        if not answer or not answer.strip():
+            answer = "Lo siento, no encontré información exacta sobre eso. ¿Puedes reformular tu pregunta?"
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        logger.exception("RAG error")
+        answer = f"Hubo un error procesando tu solicitud. Intenta de nuevo. (detalle: {str(e)[:180]})"
+
+    wa_res = await send_whatsapp_text(from_number, answer)
+    logger.info("WA OUT: %s", wa_res)
+
+    return JSONResponse({"ok": True}, status_code=200)
