@@ -1,43 +1,59 @@
 # app/rag.py
-import httpx
-from typing import List, Dict, Any, Tuple
+import os, math, logging
+from typing import List, Dict, Any
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
+
+# ---- ENV ----
+QDRANT_URL       = (os.getenv("QDRANT_URL") or "").strip()
+QDRANT_API_KEY   = (os.getenv("QDRANT_API_KEY") or "").strip()
+QDRANT_COLLECTION= (os.getenv("QDRANT_COLLECTION") or "ccp_docs").strip()
+HF_EMBED_MODEL   = (os.getenv("HF_EMBED_MODEL") or "intfloat/multilingual-e5-small").strip()
+GROQ_API_KEY     = (os.getenv("GROQ_API_KEY") or "").strip()
+GROQ_MODEL       = (os.getenv("GROQ_MODEL") or "gemma2-9b-it").strip()
+
+# ---- LOGS ----
+logger = logging.getLogger("rag")
+logger.setLevel(logging.INFO)
+
+# ---- Qdrant client ----
 from qdrant_client import QdrantClient
+from qdrant_client.http.models import Filter
 
-from app.embeddings import embed_texts  # <- usamos la API de HF (async)
-from app.settings import get_settings
+_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=90)
 
-S = get_settings()
+# ---- Embeddings locales (dim 384 con e5-small) ----
+try:
+    from sentence_transformers import SentenceTransformer
+    _st = SentenceTransformer(HF_EMBED_MODEL, device="cpu")
+    _EMBED_DIM = _st.get_sentence_embedding_dimension()
+except Exception as e:
+    raise RuntimeError(f"❌ No pude cargar SentenceTransformer({HF_EMBED_MODEL}): {e}")
 
+def _embed_query(text: str) -> List[float]:
+    vec = _st.encode([text], normalize_embeddings=True, batch_size=1, convert_to_numpy=False)[0]
+    return [float(x) for x in vec]
 
-def _connect_qdrant() -> QdrantClient:
-    return QdrantClient(url=S.URL_QDRANT, api_key=S.CLAVE_API_QDRANT, timeout=60)
-
-
-async def retrieve(query: str, k: int = 4) -> List[Dict[str, Any]]:
-    """
-    Recupera los k fragmentos más relevantes desde Qdrant.
-    Genera el embedding del query usando Hugging Face (embed_texts) y ejecuta la búsqueda.
-    """
-    client = _connect_qdrant()
-    qvec = (await embed_texts([query]))[0]  # <- embedding async
-    res = client.search(
-        collection_name=S.COLECCION_QDRANT,
-        query_vector=qvec,
-        limit=k,
-        with_payload=True,
-    )
-    out: List[Dict[str, Any]] = []
-    for p in res:
-        payload = p.payload or {}
-        out.append(
-            {
-                "text": payload.get("text", ""),
-                "page": payload.get("page"),
-                "score": float(p.score),
-            }
-        )
+# ---- Buscador en Qdrant ----
+def _search(qvec: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
+    hits = _client.search(collection_name=QDRANT_COLLECTION, query_vector=qvec, limit=top_k)
+    out = []
+    for h in hits:
+        out.append({
+            "score": float(h.score),
+            "text": (h.payload or {}).get("text", ""),
+            "page": (h.payload or {}).get("page", None),
+            "source": (h.payload or {}).get("source", ""),
+        })
     return out
 
+# ---- Construcción de prompt (breve y exacto para WhatsApp) ----
+SYSTEM = (
+    "Eres el asistente oficial de la Cámara de Comercio de Pamplona (Colombia). "
+    "Responde SOLO sobre servicios, trámites y horarios de la Cámara. "
+    "Sé conciso (WhatsApp), con viñetas cuando ayude. Si no está en las fuentes, di con claridad que no tienes esa información."
+)
 
 def build_prompt(user_msg: str, ctx_snippets: List[Dict[str, Any]]) -> str:
     ctx_txt = "\n\n".join([f"- (pág.{c.get('page','?')}) {c['text']}" for c in ctx_snippets])
@@ -63,59 +79,44 @@ def build_prompt(user_msg: str, ctx_snippets: List[Dict[str, Any]]) -> str:
     return final
 
 
-def is_greeting_or_farewell(text: str) -> Tuple[bool, str]:
-    t = (text or "").lower()
-    saludos = ["hola", "buenos días", "buenas tardes", "buenas noches", "qué tal", "buen día"]
-    desped = ["gracias", "muchas gracias", "hasta luego", "chao", "adiós", "nos vemos"]
-    if any(s in t for s in saludos):
-        return True, (
-            "¡Hola! 👋 Soy el asistente de la Cámara de Comercio de Pamplona. "
-            "¿En qué puedo ayudarte? Puedo orientarte sobre matrícula, renovación, "
-            "ESAL, conciliación, RUES, certificados y eventos."
-        )
-    if any(d in t for d in desped):
-        return True, (
-            "¡Con gusto! 😊 Si necesitas algo más de la Cámara de Comercio de Pamplona, "
-            "escríbeme cuando quieras. ¡Que tengas un excelente día!"
-        )
-    return False, ""
+# ---- Llamada a Groq (vía endpoint OpenAI-compatible) ----
+import httpx
 
-
-async def call_groq_chat(system_prompt: str) -> str:
-    """
-    Llama a Groq (Gemma) por HTTP. Devuelve texto plano.
-    """
+def _llm_answer(prompt: str) -> str:
+    if not GROQ_API_KEY:
+        return "⚠️ Falta GROQ_API_KEY en el entorno. No puedo generar respuesta."
     url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {S.CLAVE_GROQ}", "Content-Type": "application/json"}
-    payload = {
-        "model": S.MODELO_GROQ,
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    body = {
+        "model": GROQ_MODEL,
         "messages": [
-            {"role": "system", "content": "Sigue las instrucciones y responde solo en español."},
-            {"role": "user", "content": system_prompt},
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": prompt}
         ],
         "temperature": 0.2,
-        "max_tokens": 350,
+        "max_tokens": 450,
     }
-    async with httpx.AsyncClient(timeout=S.TIMEOUT_HTTP) as client:
-        r = await client.post(url, headers=headers, json=payload)
+    with httpx.Client(timeout=60) as cli:
+        r = cli.post(url, headers=headers, json=body)
+        r.raise_for_status()
         data = r.json()
-        try:
-            return data["choices"][0]["message"]["content"].strip()
-        except Exception:
-            return f"No pude generar respuesta (Groq). Detalle: {data}"
+        return data["choices"][0]["message"]["content"].strip()
 
-
-async def answer_with_rag(user_msg: str) -> str:
-    # Small talk (saludos/despedidas)
-    ok_small, smalltalk = is_greeting_or_farewell(user_msg)
-    if ok_small:
-        return smalltalk
-
-    # Recuperación + generación
-    ctx = await retrieve(user_msg, k=5)  # <- ahora es async
-    prompt = build_prompt(user_msg, ctx)
-    answer = await call_groq_chat(prompt)
-
-    if not ctx:
-        answer += "\n\n(No encontré coincidencias en los documentos; intenta con otra consulta o actualiza el PDF)."
-    return answer
+# ---- API principal: answer_with_rag ----
+def answer_with_rag(query: str, top_k: int = 5) -> str:
+    try:
+        if not query or not query.strip():
+            return "¿Podrías escribir tu pregunta?"
+        logger.info(f"[RAG] Modelo embeddings: {HF_EMBED_MODEL} (dim={_EMBED_DIM}) | Coll={QDRANT_COLLECTION}")
+        qvec = _embed_query(query)
+        docs = _search(qvec, top_k=top_k)
+        if not docs:
+            return "No encontré información sobre eso en la Cámara de Comercio de Pamplona."
+        prompt = _build_prompt(query, docs)
+        ans = _llm_answer(prompt)
+        if not ans:
+            return "No pude generar respuesta en este momento."
+        return ans
+    except Exception as e:
+        logger.exception(f"[RAG] Error: {e}")
+        return f"⚠️ Error en RAG: {e}"
