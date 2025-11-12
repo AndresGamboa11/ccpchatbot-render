@@ -29,6 +29,13 @@ GROQ_MODEL        = (os.getenv("GROQ_MODEL") or "gemma2-9b-it").strip()
 HF_TIMEOUT = float(os.getenv("HF_TIMEOUT", "60"))
 HF_RETRIES = int(os.getenv("HF_RETRIES", "2"))
 
+# Modelos de respaldo por si el principal no tiene Inference API activo
+HF_EMBED_FALLBACKS = [
+    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    "Alibaba-NLP/gte-multilingual-base",
+    "intfloat/multilingual-e5-base",
+]
+
 # ─────────────────────────────────────────────────────────────
 # LOG
 # ─────────────────────────────────────────────────────────────
@@ -88,34 +95,67 @@ def _parse_hf_feature_response(data: Any) -> List[List[float]]:
             return out
     return []
 
+def _hf_post(url: str, token: str, payload: dict, timeout: float):
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    with httpx.Client(timeout=timeout) as cli:
+        r = cli.post(url, headers=headers, json=payload)
+    return r
+
+def _try_model_embeddings(texts: List[str], model: str, token: str) -> List[List[float]]:
+    """
+    Intenta primero el endpoint /embeddings/{model} y luego
+    /pipeline/feature-extraction/{model}. Si ambos fallan, levanta excepción.
+    """
+    # 1) Nuevo endpoint de embeddings
+    url1 = f"https://api-inference.huggingface.co/embeddings/{model}"
+    r1 = _hf_post(url1, token, {"inputs": texts, "options": {"wait_for_model": True}}, HF_TIMEOUT)
+    if r1.is_success:
+        data = r1.json()
+        vecs = _parse_hf_feature_response(data)
+        if vecs:
+            return vecs
+    else:
+        log.warning("httpx: Solicitud HTTP: POST %s %s", url1, r1.reason_phrase or r1.status_code)
+
+    # 2) Fallback al pipeline feature-extraction
+    url2 = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model}"
+    r2 = _hf_post(url2, token, {"inputs": texts, "options": {"wait_for_model": True}}, HF_TIMEOUT)
+    if r2.is_success:
+        data = r2.json()
+        vecs = _parse_hf_feature_response(data)
+        if vecs:
+            return vecs
+    else:
+        log.warning("httpx: Solicitud HTTP: POST %s %s", url2, r2.reason_phrase or r2.status_code)
+
+    # Ninguno devolvió embeddings: provoca raise_for_status del último response
+    r = r2 if not r1.is_success else r1
+    r.raise_for_status()
+
 def hf_embed_texts_cloud(texts: List[str], model: str, token: str) -> List[List[float]]:
     """
-    Endpoint correcto de HF (no usar /models):
-      POST https://api-inference.huggingface.co/pipeline/feature-extraction/{model}
+    Intenta con HF_EMBED_MODEL; si falla (410/4xx/5xx), rota por HF_EMBED_FALLBACKS.
     """
     if not texts:
         return []
-    url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model}"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"inputs": texts, "options": {"wait_for_model": True}}
 
+    models_to_try = [model] + [m for m in HF_EMBED_FALLBACKS if m != model]
     last_err = None
-    for attempt in range(1, HF_RETRIES + 2):
-        try:
-            with httpx.Client(timeout=HF_TIMEOUT) as cli:
-                r = cli.post(url, headers=headers, json=payload)
-            r.raise_for_status()
-            vecs = _parse_hf_feature_response(r.json())
-            if not vecs:
-                raise RuntimeError("Respuesta de HF sin embeddings")
-            return vecs
-        except Exception as e:
-            last_err = e
-            log.warning("[HF] intento %s falló: %s", attempt, e)
-            if attempt <= HF_RETRIES:
+
+    for m in models_to_try:
+        for attempt in range(1, HF_RETRIES + 2):
+            try:
+                vecs = _try_model_embeddings(texts, m, token)
+                if vecs:
+                    if m != model:
+                        log.info("[HF] usando modelo de respaldo: %s", m)
+                    return vecs
+            except Exception as e:
+                last_err = e
+                log.warning("trap: [HF] intento %s con %s falló: %s", attempt, m, e)
                 time.sleep(1.2 * attempt)
                 continue
-            break
+
     raise RuntimeError(f"HF embeddings falló: {last_err}")
 
 def _embed_query_cloud(text: str) -> List[float]:
