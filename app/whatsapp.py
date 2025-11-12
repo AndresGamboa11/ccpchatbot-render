@@ -64,10 +64,11 @@ async def send_whatsapp_text(to_number: str, body: str) -> dict:
 # ─────────────────────────────────────────────────────────────
 # Enviar “escribiendo...” (typing)
 # ─────────────────────────────────────────────────────────────
+# ------------------- Enviar “escribiendo...” -------------------
 async def send_typing_on(to_number: str) -> dict:
     """
     Envía la señal 'typing_on' para mostrar que el bot está escribiendo.
-    Es opcional, pero mejora la experiencia del usuario.
+    Formato actual de la Cloud API: type='typing', typing='on'
     """
     if not WA_TOKEN or not WA_PHONE_ID:
         logger.warning("⚠️ No se pudo enviar typing_on: faltan credenciales WA.")
@@ -81,8 +82,8 @@ async def send_typing_on(to_number: str) -> dict:
     payload = {
         "messaging_product": "whatsapp",
         "to": to_number,
-        "type": "action",
-        "action": {"typing": "on"},
+        "type": "typing",
+        "typing": "on",
     }
 
     try:
@@ -90,7 +91,10 @@ async def send_typing_on(to_number: str) -> dict:
             r = await cli.post(url, headers=headers, json=payload)
             if r.is_success:
                 logger.debug("✏️ typing_on enviado a %s", to_number)
+            else:
+                logger.debug("typing_on no aceptado: %s", r.text)
             return {"ok": r.is_success, "status": r.status_code}
     except Exception as e:
         logger.debug("No se pudo enviar 'typing_on': %s", e)
         return {"ok": False, "error": str(e)}
+
