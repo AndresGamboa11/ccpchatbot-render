@@ -3,26 +3,42 @@ import os, json, logging
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from dotenv import load_dotenv, find_dotenv
 
 from app.settings import get_settings
-from app.rag import answer_with_rag              # <- función SÍNCRONA (no usar await)
-from app.whatsapp import send_whatsapp_text, send_typing_on  # <- funciones ASYNC
+from app.rag import answer_with_rag                         # <- SÍNCRONA (no await)
+from app.whatsapp import send_whatsapp_text, send_typing_on # <- ASYNC (sí await)
 from app.mcp_server import router as mcp_router
+
+# ─────────────────────────────────────────────────────────────
+# Carga .env solo si existe y SIN override (no pisar Render)
+# ─────────────────────────────────────────────────────────────
+_dotenv = find_dotenv(usecwd=True)
+if _dotenv:
+    load_dotenv(_dotenv, override=False)
 
 S = get_settings()
 app = FastAPI(title="CCP Chatbot")
 
-# ---------------- Logs ----------------
+# ─────────────────────────────────────────────────────────────
+# Logs
+# ─────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ccp")
 
-# ---------------- Archivos estáticos (opcional) ----------------
+# ─────────────────────────────────────────────────────────────
+# Archivos estáticos (opcional)
+# ─────────────────────────────────────────────────────────────
 app.mount("/static", StaticFiles(directory="static", check_dir=False), name="static")
 
-# ---------------- MCP ----------------
+# ─────────────────────────────────────────────────────────────
+# MCP
+# ─────────────────────────────────────────────────────────────
 app.include_router(mcp_router)
 
-# ---------------- Salud ----------------
+# ─────────────────────────────────────────────────────────────
+# Salud / Diagnóstico
+# ─────────────────────────────────────────────────────────────
 @app.get("/")
 def home():
     return {"ok": True, "service": "Chatbot CCP online"}
@@ -31,7 +47,25 @@ def home():
 async def healthz():
     return {"ok": True, "env": os.environ.get("RENDER", "render"), "port": os.environ.get("PORT")}
 
-# ---------------- Diagnóstico RAG ----------------
+@app.get("/debug/env")
+def debug_env():
+    def ok(k): return bool(os.getenv(k))
+    return {
+        # RAG / HF / Qdrant / Groq (sin revelar valores)
+        "HF_API_TOKEN": ok("HF_API_TOKEN"),
+        "HF_EMBED_MODEL": os.getenv("HF_EMBED_MODEL"),
+        "QDRANT_URL": ok("QDRANT_URL"),
+        "QDRANT_API_KEY": ok("QDRANT_API_KEY"),
+        "QDRANT_COLLECTION": os.getenv("QDRANT_COLLECTION"),
+        "GROQ_API_KEY": ok("GROQ_API_KEY"),
+        "GROQ_MODEL": os.getenv("GROQ_MODEL"),
+        # WhatsApp
+        "WA_ACCESS_TOKEN": ok("WA_ACCESS_TOKEN"),
+        "WA_PHONE_NUMBER_ID": ok("WA_PHONE_NUMBER_ID"),
+        "WA_VERIFY_TOKEN": ok("WA_VERIFY_TOKEN"),
+        "WA_API_VERSION": os.getenv("WA_API_VERSION"),
+    }
+
 @app.get("/debug/rag")
 def debug_rag(q: str = ""):
     if not q.strip():
@@ -44,7 +78,9 @@ def debug_rag(q: str = ""):
         logger.exception("[/debug/rag] Error")
         return JSONResponse({"error": str(e)}, status_code=500)
 
-# ---------------- WhatsApp Webhook ----------------
+# ─────────────────────────────────────────────────────────────
+# WhatsApp Webhook
+# ─────────────────────────────────────────────────────────────
 WA_VERIFY_TOKEN = (os.getenv("WA_VERIFY_TOKEN") or "").strip()
 
 # 1) Verificación (GET)
@@ -92,7 +128,7 @@ def _extract_wa_message(payload: dict):
                     text = (interactive.get("list_reply", {}).get("title") or "").strip()
 
             elif msg_type == "image":
-                text = "imagen"
+                text = "imagen"  # aquí podrías enganchar OCR si lo necesitas
 
             return from_number, text
 
@@ -136,16 +172,16 @@ async def receive_webhook(request: Request):
         answer = answer_with_rag(text)
         if not answer or not answer.strip():
             answer = "Lo siento, no encontré información exacta sobre eso. ¿Puedes reformular tu pregunta?"
-    except Exception as e:
+    except Exception:
         logger.exception("RAG error")
-        # mensaje corto y claro para el usuario; logs muestran detalle técnico
+        # mensaje corto para el usuario; logs muestran detalle técnico
         answer = "Hubo un error procesando tu solicitud. Intenta de nuevo en unos minutos."
 
     # ----- Responder por WhatsApp -----
     try:
         wa_res = await send_whatsapp_text(from_number, answer)  # esta sí es ASYNC
         logger.info("WA OUT: %s", wa_res)
-    except Exception as e:
+    except Exception:
         logger.exception("WA send error")
 
     return JSONResponse({"ok": True}, status_code=200)
