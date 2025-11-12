@@ -10,6 +10,10 @@ import httpx
 import numpy as np
 from typing import List
 from app.settings import get_settings
+from app.hf_embed import hf_embed
+
+# ...
+vectors = hf_embed(textos, model=HF_EMBED_MODEL, batch_size=32)
 
 S = get_settings()
 
