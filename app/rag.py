@@ -7,10 +7,7 @@ import httpx
 from dotenv import load_dotenv, find_dotenv
 from qdrant_client import QdrantClient
 from huggingface_hub import InferenceClient
-from app.hf_embed import hf_embed
 
-# ...
-vectors = hf_embed(textos, model=HF_EMBED_MODEL, batch_size=32)
 # ─────────────────────────────────────────────────────────────
 # Carga .env solo si existe y SIN override (no pisar Render)
 # ─────────────────────────────────────────────────────────────
@@ -59,7 +56,7 @@ def _qdrant() -> QdrantClient:
     return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=90)
 
 # ─────────────────────────────────────────────────────────────
-# Utilidades de vectores (por si el provider devolviera por-tokens)
+# Utilidades de vectores
 # ─────────────────────────────────────────────────────────────
 def _mean_pool_2d(vectors_2d: List[List[float]]) -> List[float]:
     if not vectors_2d:
@@ -83,7 +80,7 @@ def _normalize(vec: List[float]) -> List[float]:
 
 def _coerce_to_list_of_vectors(out: Any) -> List[List[float]]:
     """
-    Normaliza la salida de InferenceClient.feature_extraction a List[List[float]].
+    Normaliza la salida de feature_extraction a List[List[float]].
     - Si viene [float, ...] → [[...]]
     - Si viene [[float, ...], ...] → tal cual
     - Si viniera tokens x dim (lista de listas) → mean-pooling y normaliza
@@ -91,71 +88,104 @@ def _coerce_to_list_of_vectors(out: Any) -> List[List[float]]:
     if out is None:
         return []
     if isinstance(out, list) and out and isinstance(out[0], (int, float)):
-        # vector 1D
         return [_normalize([float(x) for x in out])]
     if isinstance(out, list) and out and isinstance(out[0], list):
-        # puede ser [vec1, vec2, ...] (multi-input) o [tokens x dim]
-        # Heurística: si el primer elemento es lista de floats → asumimos lista de vectores
         if out[0] and all(isinstance(x, (int, float)) for x in out[0]):
-            # Lista de vectores (multi-input)
-            return [[float(x) for x in v] for v in out]  # el provider puede ya normalizar
-        # Si es tokens x dim, hacemos pooling
+            return [[float(x) for x in v] for v in out]
         pooled = _mean_pool_2d(out)
         if pooled:
             return [_normalize(pooled)]
     return []
 
 # ─────────────────────────────────────────────────────────────
-# HF CLOUD EMBEDDINGS (router nuevo con InferenceClient)
+# HF CLOUD EMBEDDINGS (InferenceClient) con compatibilidad de firma
 # ─────────────────────────────────────────────────────────────
-# Cliente global: provider "hf-inference" (serverless Providers)
-_HF_CLIENT = None
+# Prefijo para modelos E5/GTE
+_E5_LIKE = {
+    "intfloat/multilingual-e5-small",
+    "intfloat/multilingual-e5-base",
+    "intfloat/e5-base",
+    "intfloat/e5-large",
+    "alibaba-nlp/gte-base",
+    "alibaba-nlp/gte-multilingual-base",
+    "gte-small",
+    "gte-large",
+}
+def _maybe_prefix(text: str, model_name: str) -> str:
+    name = model_name.lower()
+    if any(m in name for m in _E5_LIKE):
+        if not text.startswith("passage: "):
+            return f"passage: {text}"
+    return text
+
+_HF_CLIENT: InferenceClient | None = None
 def _hf_client() -> InferenceClient:
     global _HF_CLIENT
     if _HF_CLIENT is None:
         if not HF_API_TOKEN:
             raise RuntimeError("Falta HF_API_TOKEN (o HF_TOKEN) para incrustaciones en la nube.")
-        # provider="hf-inference" usa el router de Inference Providers
-        _HF_CLIENT = InferenceClient(provider="hf-inference", api_key=HF_API_TOKEN)
+        # Cliente general; el modelo se pasa por llamada
+        _HF_CLIENT = InferenceClient(token=HF_API_TOKEN)
     return _HF_CLIENT
 
 def hf_embed_texts_cloud(texts: List[str], model: str) -> List[List[float]]:
     """
-    Llama al router nuevo de HF para 'feature_extraction' (embeddings).
-    Rota por modelos de respaldo si falla. Reintentos controlados por HF_RETRIES.
+    Llama al router de HF para 'feature_extraction' con reintentos y fallbacks.
+    Usa firma compatible: primero text=..., y si falla, posicional.
     """
     if not texts:
         return []
 
     models_to_try = [model] + [m for m in HF_EMBED_FALLBACKS if m != model]
-    last_err = None
-
+    last_err: Exception | None = None
     cli = _hf_client()
 
     for m in models_to_try:
+        # prefijos E5/GTE
+        tx = [_maybe_prefix(t, m) for t in texts]
+        payload = tx[0] if len(tx) == 1 else tx
+
         for attempt in range(1, HF_RETRIES + 2):
             try:
-                # Nota: normalize=True para que devuelva L2-normalizado
-                # El método acepta string o lista de strings.
-                payload = texts[0] if len(texts) == 1 else texts
+                # Firma nueva: text=...
                 out = cli.feature_extraction(
-                    inputs=payload,
                     model=m,
-                    # Algunos despliegues soportan este parámetro opcional:
-                    # timeout=HF_TIMEOUT,  # si tu versión de huggingface_hub lo soporta
+                    text=payload,
+                    pooling="mean",
                     normalize=True,
+                    truncate=True,
+                    timeout=HF_TIMEOUT,
                 )
                 vecs = _coerce_to_list_of_vectors(out)
                 if vecs:
                     if m != model:
                         log.info("[HF] usando modelo de respaldo: %s", m)
                     return vecs
-                raise RuntimeError("Provider devolvió salida vacía o no interpretable.")
+                raise RuntimeError("Salida vacía/no interpretable.")
+            except TypeError:
+                # Firma antigua: primer argumento posicional
+                try:
+                    out = cli.feature_extraction(
+                        payload,
+                        model=m,
+                        pooling="mean",
+                        normalize=True,
+                        truncate=True,
+                        timeout=HF_TIMEOUT,
+                    )
+                    vecs = _coerce_to_list_of_vectors(out)
+                    if vecs:
+                        if m != model:
+                            log.info("[HF] usando modelo de respaldo: %s", m)
+                        return vecs
+                    raise RuntimeError("Salida vacía/no interpretable.")
+                except Exception as e2:
+                    last_err = e2
             except Exception as e:
                 last_err = e
-                log.warning("trap: [HF] intento %s con %s falló: %s", attempt, m, e)
-                time.sleep(1.2 * attempt)
-                continue
+
+            log.warning("trap: [HF] intento %s con %s falló: %s", attempt, m, last_err)
+            time.sleep(1.2 * attempt)
 
     raise RuntimeError(f"HF embeddings falló: {last_err}")
 
@@ -169,7 +199,7 @@ def _embed_query_cloud(text: str) -> List[float]:
 def _search(qvec: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
     client = _qdrant()
     hits = client.search(collection_name=QDRANT_COLLECTION, query_vector=qvec, limit=top_k)
-    out = []
+    out: List[Dict[str, Any]] = []
     for h in hits:
         p = h.payload or {}
         out.append({
