@@ -130,84 +130,54 @@ def _hf_client() -> InferenceClient:
 
 def hf_embed_texts_cloud(texts: List[str], model: str) -> List[List[float]]:
     """
-    Embeddings en nube con máxima compatibilidad:
-      A) InferenceClient (firma nueva/antigua)
-      B) Fallback a Router HF (https://router.huggingface.co/hf-inference)
-    Reintentos + fallbacks de modelo definidos arriba.
+    Embeddings vía Hugging Face Router (único endpoint oficial desde 2024):
+        https://router.huggingface.co/hf-inference
+    Usa task='feature-extraction' y hace mean-pooling local.
+    Compatible con cualquier modelo público y tokens 'read'.
     """
     if not texts:
         return []
+    if not HF_API_TOKEN:
+        raise RuntimeError("Falta HF_API_TOKEN en entorno (necesario para router HF).")
 
-    models_to_try = [model] + [m for m in HF_EMBED_FALLBACKS if m != model]
-    last_err: Exception | None = None
-    cli = _hf_client()  # puede seguir funcionando en algunas versiones
+    # Prefijo E5/GTE
+    tx = [_maybe_prefix(t, model) for t in texts]
+    payload = tx[0] if len(tx) == 1 else tx
 
-    def _ok(vecs: List[List[float]]) -> bool:
-        return bool(vecs and isinstance(vecs[0], list) and len(vecs[0]) > 0)
+    url = "https://router.huggingface.co/hf-inference"
+    headers = {
+        "Authorization": f"Bearer {HF_API_TOKEN}",
+        "Content-Type": "application/json",
+        "X-Wait-For-Model": "true",
+        "X-Use-Cache": "true",
+    }
+    body = {
+        "model": model,
+        "task": "feature-extraction",
+        "inputs": payload,
+    }
 
-    def _router_feature_extraction(token: str, mdl: str, payload: Any) -> List[List[float]]:
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        # 1) Ruta específica de task
-        urls = [
-            "https://router.huggingface.co/hf-inference/feature-extraction",
-            # 2) Ruta genérica + task
-            "https://router.huggingface.co/hf-inference",
-        ]
-        bodies = [
-            {"model": mdl, "inputs": payload},
-            {"model": mdl, "task": "feature-extraction", "inputs": payload},
-        ]
-        for url, body in zip(urls, bodies):
-            try:
-                with httpx.Client(timeout=HF_TIMEOUT) as s:
-                    r = s.post(url, headers=headers, json=body)
-                    # si router devuelve 404/422 en una variante, probamos la otra
-                    r.raise_for_status()
-                    data = r.json()
-                vecs = _coerce_to_list_of_vectors(data)
-                if _ok(vecs):
-                    return vecs
-            except Exception as e:
-                nonlocal last_err
-                last_err = e
-                continue
-        raise RuntimeError(f"Router HF no aceptó formatos: {last_err}")
+    try:
+        with httpx.Client(timeout=HF_TIMEOUT) as s:
+            r = s.post(url, headers=headers, json=body)
+            if r.status_code >= 400:
+                try:
+                    err_body = r.json()
+                except Exception:
+                    err_body = r.text
+                raise RuntimeError(
+                    f"Router HF error {r.status_code}: {err_body}"
+                )
+            data = r.json()
+    except Exception as e:
+        raise RuntimeError(f"Error al contactar el router HF: {e}")
 
-    for m in models_to_try:
-        # Prefijos E5/GTE
-        tx = [_maybe_prefix(t, m) for t in texts]
-        payload = tx[0] if len(tx) == 1 else tx
+    # Normalizamos la salida
+    vecs = _coerce_to_list_of_vectors(data)
+    if not vecs:
+        raise RuntimeError("Router devolvió salida vacía o no interpretable.")
+    return vecs
 
-        for attempt in range(1, HF_RETRIES + 2):
-            # ---------- A) InferenceClient (varias firmas) ----------
-            try:
-                out = cli.feature_extraction(model=m, text=payload)  # firma moderna mínima
-                vecs = _coerce_to_list_of_vectors(out)
-                if _ok(vecs):
-                    if m != model:
-                        log.info("[HF] usando modelo de respaldo: %s", m)
-                    return vecs
-                raise RuntimeError("Salida vacía/no interpretable (client).")
-            except Exception as e_client:
-                last_err = e_client
-
-            # Si el error previo claramente indica 410 (endpoint viejo),
-            # o por cualquier error, probamos Router directamente:
-            try:
-                if not HF_API_TOKEN:
-                    raise RuntimeError("Falta HF_API_TOKEN para Router HF.")
-                vecs = _router_feature_extraction(HF_API_TOKEN, m, payload)
-                if _ok(vecs):
-                    if m != model:
-                        log.info("[HF] usando modelo de respaldo (Router): %s", m)
-                    return vecs
-            except Exception as e_router:
-                last_err = e_router
-
-            log.warning("trap: [HF] intento %s con %s falló: %s", attempt, m, last_err)
-            time.sleep(1.2 * attempt)
-
-    raise RuntimeError(f"HF embeddings falló: {last_err}")
 
 def _embed_query_cloud(text: str) -> List[float]:
     try:
