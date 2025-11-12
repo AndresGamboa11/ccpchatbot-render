@@ -23,7 +23,10 @@ import httpx
 from dotenv import load_dotenv
 from pypdf import PdfReader
 from qdrant_client import QdrantClient, models
+from app.hf_embed import hf_embed
 
+# ...
+vectors = hf_embed(textos, model=HF_EMBED_MODEL, batch_size=32)
 # -------- Cargar .env (forzar override) --------
 load_dotenv(override=True)
 
