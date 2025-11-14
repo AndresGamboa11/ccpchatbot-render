@@ -1,16 +1,13 @@
 # ingest/ingest_ccp.py
 # -*- coding: utf-8 -*-
 """
-Ingesta de CAMARA.pdf a Qdrant Cloud usando embeddings EN LA NUBE (Hugging Face Inference).
-No requiere sentence-transformers local.
+Ingesta de CAMARA.pdf a Qdrant Cloud usando FastEmbed (local, sin API externa).
 
 Requiere en .env:
 QDRANT_URL=https://<tu-id>.<region>.qdrant.io
 QDRANT_API_KEY=<tu_api_key>
 QDRANT_COLLECTION=ccp_docs
-
-HF_API_TOKEN=hf_xxx
-HF_EMBED_MODEL=intfloat/multilingual-e5-small   (recomendado, multilingüe)
+EMBED_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 """
 
 import os
@@ -23,13 +20,9 @@ from typing import List, Any, Iterable, Tuple
 from dotenv import load_dotenv
 from pypdf import PdfReader
 from qdrant_client import QdrantClient, models
+from fastembed import TextEmbedding
 
-# Usamos la misma ruta de embeddings cloud que en app/rag.py
-from app.rag import hf_embed_texts_cloud, HF_EMBED_MODEL
-
-# -------- Cargar .env (forzar override para CLI) --------
-load_dotenv(override=True)
-
+# -------- Cargar .env --------
 def root_dir() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -80,25 +73,6 @@ def batched(iterable: Iterable[Any], n: int) -> Iterable[List[Any]]:
     if batch:
         yield batch
 
-# ---------------- Embeddings (solo nube) ----------------
-def embed_texts_cloud_batched(texts: List[str], model: str, batch_size: int = 64) -> List[List[float]]:
-    """
-    Envuelve hf_embed_texts_cloud en lotes para evitar timeouts y respuestas enormes.
-    """
-    out: List[List[float]] = []
-    for chunk in batched(texts, batch_size):
-        vecs = hf_embed_texts_cloud(chunk, model=model)
-        if not vecs or len(vecs) != len(chunk):
-            # hf_embed_texts_cloud puede devolver un solo vector si solo hay 1 texto;
-            # aquí garantizamos alineación 1:1.
-            if len(chunk) == 1 and vecs:
-                out.extend(vecs)
-            else:
-                raise RuntimeError("HF no devolvió la misma cantidad de vectores que textos.")
-        else:
-            out.extend(vecs)
-    return out
-
 # ---------------- Ingesta principal ----------------
 def main():
     load_env()
@@ -106,15 +80,15 @@ def main():
     QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
     QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
     COLLECTION = os.getenv("QDRANT_COLLECTION", "ccp_docs").strip()
+    EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2").strip()
 
     pdf_default = os.path.join(root_dir(), "knowledge", "CAMARA.pdf")
 
-    parser = argparse.ArgumentParser(description="Ingesta de PDF a Qdrant Cloud (HF embeddings nube)")
+    parser = argparse.ArgumentParser(description="Ingesta de PDF a Qdrant Cloud (FastEmbed local)")
     parser.add_argument("--pdf", default=pdf_default, help="Ruta del PDF (default: knowledge/CAMARA.pdf)")
     parser.add_argument("--collection", default=COLLECTION, help="Nombre de colección (default: ccp_docs)")
     parser.add_argument("--no-recreate", action="store_true", help="No recrear la colección si ya existe")
     parser.add_argument("--batch-size", type=int, default=64, help="Tamaño de lote para upsert a Qdrant")
-    parser.add_argument("--embed-batch", type=int, default=64, help="Tamaño de lote para llamadas HF")
     args = parser.parse_args()
 
     if not QDRANT_URL or not QDRANT_API_KEY:
@@ -133,8 +107,9 @@ def main():
     chunks = [c for c, _ in chunks_with_page]
     print(f"✅ Fragmentos: {len(chunks)}")
 
-    print(f"🧠 Generando embeddings en la nube con HF: {HF_EMBED_MODEL}")
-    vectors = embed_texts_cloud_batched(chunks, model=HF_EMBED_MODEL, batch_size=args.embed_batch)
+    print(f"🧠 Cargando modelo FastEmbed: {EMBED_MODEL}")
+    embedder = TextEmbedding(model_name=EMBED_MODEL)
+    vectors = [v.tolist() for v in embedder.embed(chunks)]
     if not vectors:
         print("❌ No se generaron embeddings")
         sys.exit(1)
@@ -146,12 +121,11 @@ def main():
 
     if not args.no_recreate:
         print(f"🧺 Recreando colección '{args.collection}'…")
-        # recreación segura
         try:
             client.get_collection(args.collection)
             client.delete_collection(args.collection)
         except Exception:
-            pass  # no existía
+            pass
         client.create_collection(
             collection_name=args.collection,
             vectors_config=models.VectorParams(size=vector_dim, distance=models.Distance.COSINE),
