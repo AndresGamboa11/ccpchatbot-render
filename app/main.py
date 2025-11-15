@@ -185,3 +185,15 @@ async def receive_webhook(request: Request):
         logger.exception("WA send error")
 
     return JSONResponse({"ok": True}, status_code=200)
+
+
+----------------------------------------------------------
+@app.get("/debug/qdrant")
+def debug_qdrant():
+    try:
+        info = debug_qdrant_sample()
+        return info
+    except Exception as e:
+        logger.exception("[/debug/qdrant] Error")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
