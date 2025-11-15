@@ -28,7 +28,8 @@ EMBED_BATCH       = int(os.getenv("EMBED_BATCH", "16"))  # batch pequeño
 
 # Groq (LLM Gemma)
 GROQ_API_KEY      = (os.getenv("GROQ_API_KEY") or "").strip()
-GROQ_MODEL        = (os.getenv("GROQ_MODEL") or "gemma2-9b-it").strip()
+GROQ_MODEL        = (os.getenv("GROQ_MODEL") or "llama-3.1-8b-instant").strip()
+
 
 # ─────────────────────────────────────────────────────────────
 # LOG
