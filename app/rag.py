@@ -1,15 +1,13 @@
-# app/rag.py — FastEmbed (local en Render) + Qdrant + Groq
-
-import os, math, logging, time
+# app/rag.py — SOLO nube (HF Inference API) + Qdrant + Groq
+import os, logging, time
 from typing import List, Dict, Any
 
 import httpx
 from dotenv import load_dotenv, find_dotenv
 from qdrant_client import QdrantClient
-from fastembed import TextEmbedding
 
 # ─────────────────────────────────────────────────────────────
-# .env (no pisar Render si no hay archivo)
+# Carga .env solo si existe y SIN override (no pisar Render)
 # ─────────────────────────────────────────────────────────────
 _dotenv = find_dotenv(usecwd=True)
 if _dotenv:
@@ -22,14 +20,15 @@ QDRANT_URL        = (os.getenv("QDRANT_URL") or "").strip()
 QDRANT_API_KEY    = (os.getenv("QDRANT_API_KEY") or "").strip()
 QDRANT_COLLECTION = (os.getenv("QDRANT_COLLECTION") or "ccp_docs").strip()
 
-# Modelo de embeddings local (FastEmbed)
-EMBED_MODEL       = (os.getenv("EMBED_MODEL")
-                     or "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2").strip()
+# Hugging Face Inference (embeddings en la nube)
+HF_API_TOKEN      = (os.getenv("HF_API_TOKEN") or "").strip()
+HF_EMBED_MODEL    = (os.getenv("HF_EMBED_MODEL")
+                     or "intfloat/multilingual-e5-small").strip()
+EMBED_BATCH       = int(os.getenv("EMBED_BATCH", "16"))  # batch pequeño para no saturar
 
+# Groq (LLM Gemma)
 GROQ_API_KEY      = (os.getenv("GROQ_API_KEY") or "").strip()
 GROQ_MODEL        = (os.getenv("GROQ_MODEL") or "gemma2-9b-it").strip()
-
-EMBED_BATCH       = int(os.getenv("EMBED_BATCH", "64"))
 
 # ─────────────────────────────────────────────────────────────
 # LOG
@@ -48,27 +47,89 @@ def _qdrant() -> QdrantClient:
     return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=90)
 
 # ─────────────────────────────────────────────────────────────
-# FastEmbed: modelo global en memoria
+# Embeddings por API (Hugging Face Inference)
 # ─────────────────────────────────────────────────────────────
-_EMBED_MODEL = None
+def _hf_embed_batch(texts: List[str]) -> List[List[float]]:
+    """
+    Envía un batch de textos a HF Inference API y devuelve la lista de vectores.
+    Usa el endpoint /models/{HF_EMBED_MODEL}, NO carga modelos en memoria.
+    """
+    if not HF_API_TOKEN:
+        raise RuntimeError("Falta HF_API_TOKEN en el entorno.")
+    if not HF_EMBED_MODEL:
+        raise RuntimeError("Falta HF_EMBED_MODEL en el entorno.")
 
-def _get_embedder() -> TextEmbedding:
-    global _EMBED_MODEL
-    if _EMBED_MODEL is None:
-        log.info("🧠 Cargando modelo FastEmbed: %s", EMBED_MODEL)
-        _EMBED_MODEL = TextEmbedding(model_name=EMBED_MODEL)
-    return _EMBED_MODEL
+    url = f"https://api-inference.huggingface.co/models/{HF_EMBED_MODEL}"
+    headers = {
+        "Authorization": f"Bearer {HF_API_TOKEN}",
+        "Accept": "application/json",
+    }
+
+    payload = {
+        "inputs": texts,
+        # Algunos modelos ignoran parameters, pero no hace daño enviarlos
+        "options": {"wait_for_model": True},
+    }
+
+    with httpx.Client(timeout=60) as cli:
+        r = cli.post(url, headers=headers, json=payload)
+        # Si el modelo está en cold start o no disponible, esto te ayuda a depurar
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            log.error("HF Inference error %s: %s", e.response.status_code, e.response.text)
+            raise
+
+        data = r.json()
+        # Para feature-extraction/embeddings, el resultado suele ser:
+        #  - lista de vectores para cada texto
+        #  - o lista de listas (si el modelo devuelve embeddings por token)
+        vecs: List[List[float]] = []
+
+        # Normalizamos: si es una lista por texto, la dejamos así
+        if isinstance(data, list) and data and isinstance(data[0], list):
+            # Puede ser:
+            #   [ [v1,...,vd], [v1,...,vd], ... ]
+            # o   [ [ [tok1], [tok2], ... ], [ [tok1], ... ], ... ]
+            for item in data:
+                if item and isinstance(item[0], list):
+                    # Promediamos embeddings por token → embedding por texto
+                    dim = len(item[0])
+                    summed = [0.0] * dim
+                    for tok_vec in item:
+                        for i, val in enumerate(tok_vec):
+                            summed[i] += float(val)
+                    vec = [v / float(len(item)) for v in summed]
+                    vecs.append(vec)
+                else:
+                    # Ya viene como vector por texto
+                    vecs.append([float(v) for v in item])
+        else:
+            raise RuntimeError(f"Formato inesperado de embeddings HF: {type(data)}")
+
+        return vecs
+
 
 def _embed_texts(texts: List[str]) -> List[List[float]]:
     """
-    Aplica TextEmbedding de FastEmbed.
-    Devuelve lista de listas (float).
+    Parte la lista en lotes pequeños y llama a HF por batch.
     """
     if not texts:
         return []
-    model = _get_embedder()
-    # embed devuelve un generador de numpy arrays → los paso a listas
-    return [vec.tolist() for vec in model.embed(texts)]
+    all_vecs: List[List[float]] = []
+    for i in range(0, len(texts), EMBED_BATCH):
+        chunk = texts[i : i + EMBED_BATCH]
+        log.info("🧠 HF embeddings (%s) batch %d-%d", HF_EMBED_MODEL, i, i + len(chunk))
+        try:
+            vecs = _hf_embed_batch(chunk)
+            all_vecs.extend(vecs)
+        except Exception as e:
+            log.exception("Error generando embeddings con HF: %s", e)
+            raise
+        # Pequeña pausa para ser amable con la API gratuita
+        time.sleep(0.2)
+    return all_vecs
+
 
 def _embed_query(text: str) -> List[float]:
     vecs = _embed_texts([text])
@@ -83,12 +144,14 @@ def _search(qvec: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for h in hits:
         p = h.payload or {}
-        out.append({
-            "score": float(h.score),
-            "text": p.get("text", ""),
-            "page": p.get("page", None),
-            "source": p.get("source", ""),
-        })
+        out.append(
+            {
+                "score": float(h.score),
+                "text": p.get("text", ""),
+                "page": p.get("page", None),
+                "source": p.get("source", ""),
+            }
+        )
     return out
 
 # ─────────────────────────────────────────────────────────────
@@ -97,7 +160,8 @@ def _search(qvec: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
 SYSTEM = (
     "Eres el asistente oficial de la Cámara de Comercio de Pamplona (Colombia). "
     "Responde SOLO sobre servicios, trámites, horarios y actividades de la Cámara. "
-    "Sé breve (WhatsApp), con viñetas. Si no está en las fuentes, dilo claramente."
+    "Sé claro y específico, evita información inventada. "
+    "Si la respuesta no está en las fuentes, dilo de forma directa."
 )
 
 def _build_prompt(user_q: str, passages: List[Dict[str, Any]]) -> str:
@@ -107,15 +171,17 @@ def _build_prompt(user_q: str, passages: List[Dict[str, Any]]) -> str:
         if snippet:
             ctx_lines.append(f"[{i}] {snippet}")
     ctx = "\n".join(ctx_lines[:8])
+
     return (
         f"{SYSTEM}\n\n"
-        f"Contexto:\n{ctx}\n\n"
+        f"Contexto (fragmentos de la Cámara de Comercio de Pamplona):\n{ctx}\n\n"
         f"Pregunta del usuario: {user_q}\n\n"
-        f"Instrucciones:\n"
-        f"- Usa SOLO el contexto.\n"
-        f"- Si hay horarios, devuélvelos completos.\n"
-        f"- Formato conciso, con viñetas cuando ayude.\n"
-        f"- No inventes datos ni enlaces."
+        f"Instrucciones para la respuesta:\n"
+        f"- Usa SOLO la información del contexto.\n"
+        f"- Si hay horarios, direcciones o teléfonos, devuélvelos completos y actualizados.\n"
+        f"- Responde en un máximo de 5–7 líneas, formato WhatsApp, usando viñetas cuando ayude.\n"
+        f"- Si la información no aparece en el contexto, responde que no cuentas con esos datos.\n"
+        f"- No inventes enlaces ni promociones."
     )
 
 # ─────────────────────────────────────────────────────────────
@@ -137,7 +203,11 @@ def _llm_answer(prompt: str) -> str:
     }
     with httpx.Client(timeout=60) as cli:
         r = cli.post(url, headers=headers, json=body)
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            log.error("Groq error %s: %s", e.response.status_code, e.response.text)
+            raise
         data = r.json()
         return (data["choices"][0]["message"]["content"] or "").strip()
 
@@ -148,14 +218,20 @@ def answer_with_rag(query: str, top_k: int = 5) -> str:
     try:
         if not query or not query.strip():
             return "¿Podrías escribir tu pregunta?"
-        log.info("[RAG] Modelo FastEmbed: %s | q='%s'", EMBED_MODEL, query[:80])
+        log.info("[RAG] Modelo HF (nube): %s | q='%s'", HF_EMBED_MODEL, query[:80])
 
+        # 1) Embeddings de la pregunta (HF Inference)
         qvec = _embed_query(query)
+
+        # 2) Búsqueda en Qdrant
         docs = _search(qvec, top_k=top_k)
         if not docs:
             return "No encontré información sobre eso en la Cámara de Comercio de Pamplona."
 
+        # 3) Construir prompt con contexto
         prompt = _build_prompt(query, docs)
+
+        # 4) Llamar a Groq (Gemma)
         ans = _llm_answer(prompt)
         return ans or "No pude generar respuesta en este momento."
     except Exception as e:
