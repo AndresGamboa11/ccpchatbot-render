@@ -176,29 +176,41 @@ def _build_prompt(user_q: str, passages: List[Dict[str, Any]]) -> str:
     )
 
 # ─────────────────────────────────────────────────────────────
-# LLM (Groq)
+# LLM (Groq) — body mínimo para evitar 400
 # ─────────────────────────────────────────────────────────────
 def _llm_answer(prompt: str) -> str:
     if not GROQ_API_KEY:
         return "⚠️ Falta GROQ_API_KEY en el entorno."
+
     url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    # 👇 Body mínimo y seguro: SOLO model + messages
     body = {
         "model": GROQ_MODEL,
         "messages": [
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.2,
-        "max_tokens": 450,
     }
+
     with httpx.Client(timeout=60) as cli:
         r = cli.post(url, headers=headers, json=body)
         try:
             r.raise_for_status()
         except httpx.HTTPStatusError as e:
-            log.error("Groq error %s: %s", e.response.status_code, e.response.text)
+            # Log completo del error de Groq para depurar
+            try:
+                err_txt = r.text
+            except Exception:
+                err_txt = "<sin cuerpo>"
+            log.error("Groq error %s: %s", e.response.status_code, err_txt)
+            # Mensaje amable para el usuario
             raise
+
         data = r.json()
         return (data["choices"][0]["message"]["content"] or "").strip()
 
