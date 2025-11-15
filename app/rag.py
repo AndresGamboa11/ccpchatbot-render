@@ -1,4 +1,4 @@
-# app/rag.py — SOLO nube (HF Inference API) + Qdrant + Groq
+# app/rag.py — SOLO nube (HF Inference API via router) + Qdrant + Groq
 import os, logging, time
 from typing import List, Dict, Any
 
@@ -24,7 +24,7 @@ QDRANT_COLLECTION = (os.getenv("QDRANT_COLLECTION") or "ccp_docs").strip()
 HF_API_TOKEN      = (os.getenv("HF_API_TOKEN") or "").strip()
 HF_EMBED_MODEL    = (os.getenv("HF_EMBED_MODEL")
                      or "intfloat/multilingual-e5-small").strip()
-EMBED_BATCH       = int(os.getenv("EMBED_BATCH", "16"))  # batch pequeño para no saturar
+EMBED_BATCH       = int(os.getenv("EMBED_BATCH", "16"))  # batch pequeño
 
 # Groq (LLM Gemma)
 GROQ_API_KEY      = (os.getenv("GROQ_API_KEY") or "").strip()
@@ -47,19 +47,20 @@ def _qdrant() -> QdrantClient:
     return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=90)
 
 # ─────────────────────────────────────────────────────────────
-# Embeddings por API (Hugging Face Inference)
+# Embeddings por API (Hugging Face Inference via router)
 # ─────────────────────────────────────────────────────────────
 def _hf_embed_batch(texts: List[str]) -> List[List[float]]:
     """
-    Envía un batch de textos a HF Inference API y devuelve la lista de vectores.
-    Usa el endpoint /models/{HF_EMBED_MODEL}, NO carga modelos en memoria.
+    Envía un batch de textos a HF Inference API (nuevo router) y devuelve la lista de vectores.
+    Usa: https://router.huggingface.co/hf-inference/models/{HF_EMBED_MODEL}
     """
     if not HF_API_TOKEN:
         raise RuntimeError("Falta HF_API_TOKEN en el entorno.")
     if not HF_EMBED_MODEL:
         raise RuntimeError("Falta HF_EMBED_MODEL en el entorno.")
 
-    url = f"https://api-inference.huggingface.co/models/{HF_EMBED_MODEL}"
+    # 👇 Nuevo endpoint recomendado por HF
+    url = f"https://router.huggingface.co/hf-inference/models/{HF_EMBED_MODEL}"
     headers = {
         "Authorization": f"Bearer {HF_API_TOKEN}",
         "Accept": "application/json",
@@ -67,13 +68,11 @@ def _hf_embed_batch(texts: List[str]) -> List[List[float]]:
 
     payload = {
         "inputs": texts,
-        # Algunos modelos ignoran parameters, pero no hace daño enviarlos
         "options": {"wait_for_model": True},
     }
 
     with httpx.Client(timeout=60) as cli:
         r = cli.post(url, headers=headers, json=payload)
-        # Si el modelo está en cold start o no disponible, esto te ayuda a depurar
         try:
             r.raise_for_status()
         except httpx.HTTPStatusError as e:
@@ -81,19 +80,13 @@ def _hf_embed_batch(texts: List[str]) -> List[List[float]]:
             raise
 
         data = r.json()
-        # Para feature-extraction/embeddings, el resultado suele ser:
-        #  - lista de vectores para cada texto
-        #  - o lista de listas (si el modelo devuelve embeddings por token)
         vecs: List[List[float]] = []
 
-        # Normalizamos: si es una lista por texto, la dejamos así
+        # Normalizamos el formato de salida
         if isinstance(data, list) and data and isinstance(data[0], list):
-            # Puede ser:
-            #   [ [v1,...,vd], [v1,...,vd], ... ]
-            # o   [ [ [tok1], [tok2], ... ], [ [tok1], ... ], ... ]
             for item in data:
                 if item and isinstance(item[0], list):
-                    # Promediamos embeddings por token → embedding por texto
+                    # Embeddings por token → promedio
                     dim = len(item[0])
                     summed = [0.0] * dim
                     for tok_vec in item:
@@ -102,7 +95,7 @@ def _hf_embed_batch(texts: List[str]) -> List[List[float]]:
                     vec = [v / float(len(item)) for v in summed]
                     vecs.append(vec)
                 else:
-                    # Ya viene como vector por texto
+                    # Ya es un vector por texto
                     vecs.append([float(v) for v in item])
         else:
             raise RuntimeError(f"Formato inesperado de embeddings HF: {type(data)}")
@@ -111,22 +104,18 @@ def _hf_embed_batch(texts: List[str]) -> List[List[float]]:
 
 
 def _embed_texts(texts: List[str]) -> List[List[float]]:
-    """
-    Parte la lista en lotes pequeños y llama a HF por batch.
-    """
     if not texts:
         return []
     all_vecs: List[List[float]] = []
     for i in range(0, len(texts), EMBED_BATCH):
         chunk = texts[i : i + EMBED_BATCH]
-        log.info("🧠 HF embeddings (%s) batch %d-%d", HF_EMBED_MODEL, i, i + len(chunk))
+        log.info("🧠 Incrustaciones HF (%s) lote %d-%d", HF_EMBED_MODEL, i, i + len(chunk))
         try:
             vecs = _hf_embed_batch(chunk)
             all_vecs.extend(vecs)
         except Exception as e:
             log.exception("Error generando embeddings con HF: %s", e)
             raise
-        # Pequeña pausa para ser amable con la API gratuita
         time.sleep(0.2)
     return all_vecs
 
@@ -220,18 +209,12 @@ def answer_with_rag(query: str, top_k: int = 5) -> str:
             return "¿Podrías escribir tu pregunta?"
         log.info("[RAG] Modelo HF (nube): %s | q='%s'", HF_EMBED_MODEL, query[:80])
 
-        # 1) Embeddings de la pregunta (HF Inference)
         qvec = _embed_query(query)
-
-        # 2) Búsqueda en Qdrant
         docs = _search(qvec, top_k=top_k)
         if not docs:
             return "No encontré información sobre eso en la Cámara de Comercio de Pamplona."
 
-        # 3) Construir prompt con contexto
         prompt = _build_prompt(query, docs)
-
-        # 4) Llamar a Groq (Gemma)
         ans = _llm_answer(prompt)
         return ans or "No pude generar respuesta en este momento."
     except Exception as e:
