@@ -4,9 +4,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv, find_dotenv
+from app.rag import answer_with_rag, debug_qdrant_sample
 
-from app.settings import get_settings
-from app.rag import answer_with_rag                         # <- SÍNCRONA (no await)
+from app.settings import get_settings                       # <- SÍNCRONA (no await)
 from app.whatsapp import send_whatsapp_text, send_typing_on # <- ASYNC (sí await)
 from app.mcp_server import router as mcp_router
 
