@@ -154,7 +154,7 @@ def _extract_wa_message(payload: dict):
 
 # 3) Recepción del webhook (POST)
 @app.post("/webhook")
-async def receive_webhook(request: Request):
+async def receive_webhook(request: Request): ##
     try:
         payload = await request.json()
     except Exception:
